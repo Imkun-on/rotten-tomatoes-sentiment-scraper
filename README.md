@@ -25,6 +25,13 @@
   and exports results to <b>CSV</b>, <b>JSON</b>, or <b>Excel</b>.
 </p>
 
+```bash
+git clone https://github.com/Imkun-on/rotten-tomatoes-sentiment-scraper.git
+cd rotten-tomatoes-sentiment-scraper
+pip install -r requirements.txt
+python cli.py
+```
+
 ---
 
 ## Table of Contents
