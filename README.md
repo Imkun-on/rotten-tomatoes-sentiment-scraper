@@ -1,12 +1,6 @@
-```
-    ____        __  __                ______                      __                     ____            _                  
-   / __ \____  / /_/ /____  ____     /_  __/___  ____ ___  ____ _/ /_____  ___  _____   / __ \___ _   __(_)__ _      _______
-  / /_/ / __ \/ __/ __/ _ \/ __ \     / / / __ \/ __ `__ \/ __ `/ __/ __ \/ _ \/ ___/  / /_/ / _ \ | / / / _ \ | /| / / ___/
- / _, _/ /_/ / /_/ /_/  __/ / / /    / / / /_/ / / / / / / /_/ / /_/ /_/ /  __(__  )  / _, _/  __/ |/ / /  __/ |/ |/ (__  ) 
-/_/ |_|\____/\__/\__/\___/_/ /_/    /_/  \____/_/ /_/ /_/\__,_/\__/\____/\___/____/  /_/ |_|\___/|___/_/\___/|__/|__/____/  
-```
+<div align="center">
 
-<h1 align="center">Rotten Tomatoes Reviews Scraper & Sentiment Analyzer</h1>
+# Rotten Tomatoes Reviews Scraper & Sentiment Analyzer
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python">
