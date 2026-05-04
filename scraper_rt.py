@@ -4,16 +4,22 @@ import html
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from bs4 import BeautifulSoup
 
-from models import MovieResult, MovieInfo, ReviewData
+from models import MovieResult, MovieInfo, ReviewData, SeasonInfo
 
 
 class RTScraper:
     BASE_URL = "https://www.rottentomatoes.com"
-    REVIEW_API = "/napi/rtcf/v1/{media_type}/{ems_id}/reviews"
+    # The internal RT review API (discovered by inspecting the `reviews.js`
+    # bundle): movies live at one path, TV seasons at another, TV episodes at
+    # a third. Show-level (`tvSeries`) endpoints don't exist — TV reviews on
+    # RT are always per-season.
+    REVIEW_API_MOVIE = "/napi/rtcf/v1/movies/{ems_id}/reviews"
+    REVIEW_API_SEASON = "/napi/rtcf/v1/tv/seasons/{ems_id}/reviews"
 
     HEADERS = {
         "User-Agent": (
@@ -322,27 +328,39 @@ class RTScraper:
     # ------------------------------------------------------------------
 
     def _get_ems_id(self, movie_url: str) -> str:
-        reviews_url = movie_url.rstrip("/") + "/reviews?type=user"
-        resp = self.session.get(reviews_url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        # Try a few candidate pages in order: the basic /reviews page works for
+        # both movies and TV shows. The "?type=user" suffix only works for
+        # movies — TV shows use "?type=verified_audience" and 404 on "type=user".
+        # Falling back to the main title page is safe because the emsId is also
+        # embedded in scripts like `mediaScorecard` there.
+        base = movie_url.rstrip("/")
+        candidates = [f"{base}/reviews", base]
 
-        script = soup.select_one('script[data-json="reviewsData"]')
-        if script and script.string:
+        for url in candidates:
             try:
-                data = json.loads(script.string)
-                ems_id = data.get("media", {}).get("emsId", "")
-                if ems_id:
-                    return ems_id
-            except (json.JSONDecodeError, TypeError):
-                pass
+                resp = self.session.get(url, timeout=15)
+                resp.raise_for_status()
+            except requests.HTTPError:
+                continue
 
-        # Fallback: regex search across all scripts
-        for s in soup.select("script"):
-            if s.string and "emsId" in s.string:
-                match = re.search(r'"emsId"\s*:\s*"([^"]+)"', s.string)
-                if match:
-                    return match.group(1)
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            script = soup.select_one('script[data-json="reviewsData"]')
+            if script and script.string:
+                try:
+                    data = json.loads(script.string)
+                    ems_id = data.get("media", {}).get("emsId", "")
+                    if ems_id:
+                        return ems_id
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            for s in soup.select("script"):
+                if s.string and "emsId" in s.string:
+                    match = re.search(r'"emsId"\s*:\s*"([^"]+)"', s.string)
+                    if match:
+                        return match.group(1)
+
         return ""
 
     # ------------------------------------------------------------------
@@ -363,10 +381,271 @@ class RTScraper:
 
     @staticmethod
     def _detect_media_type(url: str) -> str:
-        """Return 'movies' or 'tvSeries' based on URL pattern."""
-        if "/tv/" in url:
-            return "tvSeries"
+        """Return the API media type based on URL pattern.
+
+        - `season`: TV season URL (`/tv/<show>/sNN[/...]`). RT's review API only
+          serves season-level reviews for TV; the show-level `tvSeries` endpoint
+          returns 404.
+        - `movies`: anything else (movies live under `/m/`).
+        """
+        if re.search(r"/tv/[^/]+/s\d+", url):
+            return "season"
         return "movies"
+
+    @staticmethod
+    def _is_tv_show_url(url: str) -> bool:
+        """Return True for the show root URL (`/tv/<show>` without season)."""
+        return "/tv/" in url and not re.search(r"/tv/[^/]+/s\d+", url)
+
+    # ------------------------------------------------------------------
+    # Seasons (TV only)
+    # ------------------------------------------------------------------
+
+    def get_seasons(self, tv_url: str) -> list[SeasonInfo]:
+        """Return the list of seasons for a TV show, sorted by season number.
+
+        RT renders seasons inside a `<carousel-slider>` as `<tile-season
+        href="/tv/<show>/sNN">` web components. We scan for those first;
+        fall back to JSON-LD `containsSeason` and any anchor tag matching
+        the season URL pattern.
+        """
+        resp = self.session.get(tv_url, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+        soup = BeautifulSoup(html, "lxml")
+
+        seasons: list[SeasonInfo] = []
+        seen: set[int] = set()
+        show_path = tv_url.split(self.BASE_URL)[-1].rstrip("/")
+        season_re = re.compile(re.escape(show_path) + r"/s(\d+)/?$")
+
+        # Primary: <tile-season href="..."> (BeautifulSoup picks up arbitrary
+        # tag names just fine).
+        for tile in soup.find_all("tile-season"):
+            href = tile.get("href", "")
+            m = season_re.search(href)
+            if not m:
+                continue
+            num = int(m.group(1))
+            if num in seen:
+                continue
+            seen.add(num)
+            full = href if href.startswith("http") else self.BASE_URL + href
+            seasons.append(SeasonInfo(
+                number=num,
+                name=f"Season {num}",
+                url=full,
+            ))
+
+        # Fallback 1: regex over raw HTML (in case the parser drops custom
+        # elements on some Python/lxml versions).
+        if not seasons:
+            for m in re.finditer(
+                r'<tile-season[^>]+href="(' + re.escape(show_path) + r'/s(\d+))"',
+                html,
+            ):
+                href, num_str = m.group(1), m.group(2)
+                num = int(num_str)
+                if num in seen:
+                    continue
+                seen.add(num)
+                seasons.append(SeasonInfo(
+                    number=num,
+                    name=f"Season {num}",
+                    url=self.BASE_URL + href,
+                ))
+
+        # Fallback 2: JSON-LD containsSeason
+        if not seasons:
+            for script in soup.select('script[type="application/ld+json"]'):
+                if not script.string:
+                    continue
+                try:
+                    data = json.loads(script.string)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                blocks = data if isinstance(data, list) else [data]
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    for season in block.get("containsSeason", []) or []:
+                        if not isinstance(season, dict):
+                            continue
+                        s_url = season.get("url", "")
+                        if s_url and not s_url.startswith("http"):
+                            s_url = self.BASE_URL + s_url
+                        s_num_raw = season.get("seasonNumber", 0)
+                        try:
+                            s_num = int(s_num_raw)
+                        except (TypeError, ValueError):
+                            mm = re.search(r"/s(\d+)", s_url or "")
+                            s_num = int(mm.group(1)) if mm else 0
+                        if s_num in seen:
+                            continue
+                        seen.add(s_num)
+                        eps_raw = season.get("numberOfEpisodes", 0)
+                        try:
+                            eps = int(eps_raw)
+                        except (TypeError, ValueError):
+                            eps = 0
+                        seasons.append(SeasonInfo(
+                            number=s_num,
+                            name=season.get("name") or f"Season {s_num}",
+                            url=s_url,
+                            episode_count=eps,
+                        ))
+
+        # Fallback 3: any anchor pointing at /tv/<show>/sNN
+        if not seasons:
+            for link in soup.select("a[href]"):
+                href = link.get("href", "")
+                m = season_re.search(href)
+                if not m:
+                    continue
+                num = int(m.group(1))
+                if num in seen:
+                    continue
+                seen.add(num)
+                full = href if href.startswith("http") else self.BASE_URL + href
+                seasons.append(SeasonInfo(
+                    number=num,
+                    name=f"Season {num}",
+                    url=full,
+                ))
+
+        seasons.sort(key=lambda s: s.number)
+        return seasons
+
+    def _enrich_season(self, season: SeasonInfo) -> None:
+        """Fetch a season's page once and populate ems_id, episode_count,
+        tomatometer + count, popcornmeter + count.
+
+        On a season page RT exposes TWO different emsIds:
+        - `props.vanity.emsId` -> the SEASON's id (what the review API wants)
+        - `props.media.emsId`  -> the SHOW's id (would 404 the review API)
+        We always read vanity.emsId.
+        """
+        base = season.url.rstrip("/")
+        # The season ROOT page is the only one with `mediaScorecard` (which
+        # has the exact review counts). /reviews is lighter but lacks it.
+        for url in [base, f"{base}/reviews"]:
+            try:
+                resp = self.session.get(url, timeout=15)
+                resp.raise_for_status()
+                break
+            except requests.HTTPError:
+                continue
+        else:
+            return
+
+        html_text = resp.text
+        soup = BeautifulSoup(html_text, "lxml")
+
+        # The season's emsId lives in different scripts depending on which
+        # page we landed on:
+        # 1) Season root page: a dedicated `<script data-json="vanity">` with
+        #    emsId at the top level.
+        # 2) /reviews subpage: nested as `props.vanity.emsId` — and there are
+        #    multiple "props" scripts on the page; only one contains vanity,
+        #    so we must iterate them all.
+        # 3) Last resort: `reviewsData.media.emsId` (may be the SHOW emsId,
+        #    which 404s the review API, but better than nothing).
+        vanity_script = soup.select_one('script[data-json="vanity"]')
+        if vanity_script and vanity_script.string:
+            try:
+                data = json.loads(vanity_script.string)
+                if isinstance(data, dict) and data.get("emsId"):
+                    season.ems_id = data["emsId"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not season.ems_id:
+            for props_script in soup.select('script[data-json="props"]'):
+                if not props_script.string:
+                    continue
+                try:
+                    data = json.loads(props_script.string)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(data, dict):
+                    vanity = data.get("vanity") or {}
+                    if vanity.get("emsId"):
+                        season.ems_id = vanity["emsId"]
+                        break
+
+        if not season.ems_id:
+            rd_script = soup.select_one('script[data-json="reviewsData"]')
+            if rd_script and rd_script.string:
+                try:
+                    rd = json.loads(rd_script.string)
+                    season.ems_id = rd.get("media", {}).get("emsId", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        # Scores + exact review counts from mediaScorecard
+        sc_script = soup.select_one('script[data-json="mediaScorecard"]')
+        if sc_script and sc_script.string:
+            try:
+                sc = json.loads(sc_script.string)
+                cs = sc.get("criticsScore", {})
+                if isinstance(cs, dict):
+                    score_val = cs.get("score")
+                    if score_val is not None:
+                        season.tomatometer = f"{score_val}%"
+                    count_val = cs.get("reviewCount", cs.get("likedCount", ""))
+                    if count_val:
+                        season.tomatometer_num = self._parse_count(str(count_val))
+                aus = sc.get("audienceScore", {})
+                if isinstance(aus, dict):
+                    score_val = aus.get("score")
+                    if score_val is not None:
+                        season.popcornmeter = f"{score_val}%"
+                    # Prefer reviewCount (text reviews) over ratingCount
+                    # (stars-only) — it's what the review API actually returns.
+                    count_val = aus.get("reviewCount", aus.get("ratingCount", ""))
+                    if count_val:
+                        season.popcornmeter_num = self._parse_count(str(count_val))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Episode count: try JSON-LD `numberOfEpisodes`, then fall back to
+        # counting `<tile-episode>` elements (one per episode card).
+        for ld in soup.select('script[type="application/ld+json"]'):
+            if not ld.string or season.episode_count:
+                continue
+            try:
+                data = json.loads(ld.string)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            blocks = data if isinstance(data, list) else [data]
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("@type") in ("TVSeason", "TVSeries"):
+                    eps = b.get("numberOfEpisodes")
+                    if eps:
+                        try:
+                            season.episode_count = int(eps)
+                        except (TypeError, ValueError):
+                            pass
+
+        if not season.episode_count:
+            # Distinct episode hrefs (each episode card appears as
+            # <tile-episode href="/tv/<show>/sNN/eNN">). Use a set to
+            # de-dupe in case RT renders the same episode in multiple
+            # carousels.
+            ep_hrefs = set(re.findall(
+                r'<tile-episode[^>]+href="(/tv/[^"]+/s\d+/e\d+)"', html_text,
+            ))
+            if ep_hrefs:
+                season.episode_count = len(ep_hrefs)
+
+    def enrich_seasons(self, seasons: list[SeasonInfo], max_workers: int = 5) -> None:
+        """Populate ems_id, episode_count, scores and counts in parallel."""
+        if not seasons:
+            return
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(seasons))) as ex:
+            list(ex.map(self._enrich_season, seasons))
 
     # ------------------------------------------------------------------
     # Review scraping
@@ -544,17 +823,23 @@ class RTScraper:
         self,
         movie_url: str,
         movie_info: MovieInfo | None = None,
+        seasons: list[SeasonInfo] | None = None,
         on_batch=None,
         on_progress=None,
         should_stop=None,
     ) -> list[ReviewData]:
         """
         Scrape both critic (Tomatometer) and audience (Popcornmeter) reviews.
-        The number of reviews per type is determined by the counts in MovieInfo.
+
+        For movies the number of reviews per type is taken from MovieInfo. For
+        TV shows the caller must pass the `seasons` list (one or more
+        SeasonInfo): RT only exposes reviews at the season level, never at the
+        whole-show level.
 
         Args:
             movie_url:    Full RT URL
             movie_info:   Pre-fetched MovieInfo (avoids re-downloading movie page)
+            seasons:      For TV shows, the seasons whose reviews to scrape
             on_batch:     Callback(list[ReviewData]) for each page of results
             on_progress:  Callback(current_count, total)
             should_stop:  Callable() -> bool — return True to abort early
@@ -567,6 +852,21 @@ class RTScraper:
         title = movie_info.title
         genre = movie_info.genre
 
+        # TV show -> per-season scraping
+        if self._is_tv_show_url(movie_url) or self._detect_media_type(movie_url) == "season":
+            if not seasons:
+                raise ValueError(
+                    "TV shows require a list of seasons to scrape. "
+                    "Use get_seasons(url) and pass the chosen ones."
+                )
+            return self._scrape_tv_reviews(
+                seasons, title, genre,
+                on_batch=on_batch,
+                on_progress=on_progress,
+                should_stop=should_stop,
+            )
+
+        # --- Movie path ---
         critic_max = movie_info.tomatometer_num
         audience_max = movie_info.popcornmeter_num
         total = critic_max + audience_max
@@ -583,9 +883,7 @@ class RTScraper:
                 "The page structure may have changed."
             )
 
-        media_type = self._detect_media_type(movie_url)
-        api_path = self.REVIEW_API.format(media_type=media_type, ems_id=ems_id)
-        api_url = self.BASE_URL + api_path
+        api_url = self.BASE_URL + self.REVIEW_API_MOVIE.format(ems_id=ems_id)
 
         all_reviews: list[ReviewData] = []
 
@@ -613,6 +911,88 @@ class RTScraper:
             progress_total=total,
         )
         all_reviews.extend(audience)
+
+        return all_reviews
+
+    def _scrape_tv_reviews(
+        self,
+        seasons: list[SeasonInfo],
+        title: str,
+        genre: str,
+        on_batch=None,
+        on_progress=None,
+        should_stop=None,
+    ) -> list[ReviewData]:
+        """Scrape critic + audience reviews for one or more TV seasons."""
+        # Resolve emsId for any season that wasn't enriched upfront.
+        for s in seasons:
+            if not s.ems_id:
+                self._enrich_season(s)
+            if not s.ems_id:
+                raise ValueError(
+                    f"Could not find EMS ID for {s.name} ({s.url}). "
+                    "The page structure may have changed."
+                )
+
+        # Exact total taken from each season's mediaScorecard (populated by
+        # enrich_seasons). Fallback to a generous estimate only when counts
+        # are missing.
+        total = sum(s.tomatometer_num + s.popcornmeter_num for s in seasons)
+        if total == 0:
+            total = len(seasons) * 400
+
+        per_season_cap = 5000
+
+        all_reviews: list[ReviewData] = []
+        running = 0
+
+        def make_on_progress(offset: int):
+            def _cb(current, _total):
+                if on_progress:
+                    actual = offset + current
+                    # Keep the displayed total in sync with reality if the
+                    # API returns more than mediaScorecard advertised.
+                    on_progress(actual, max(total, actual))
+            return _cb
+
+        for season in seasons:
+            if should_stop and should_stop():
+                break
+
+            api_url = self.BASE_URL + self.REVIEW_API_SEASON.format(
+                ems_id=season.ems_id,
+            )
+
+            season_title = f"{title} — {season.name}"
+
+            # Critics
+            critic_cap = season.tomatometer_num or per_season_cap
+            critics = self._scrape_one_type(
+                api_url, "critic", season_title, genre, critic_cap,
+                on_batch=on_batch,
+                on_progress=make_on_progress(running),
+                should_stop=should_stop,
+            )
+            all_reviews.extend(critics)
+            running += len(critics)
+
+            if should_stop and should_stop():
+                break
+
+            # Audience
+            audience_cap = season.popcornmeter_num or per_season_cap
+            audience = self._scrape_one_type(
+                api_url, "audience", season_title, genre, audience_cap,
+                on_batch=on_batch,
+                on_progress=make_on_progress(running),
+                should_stop=should_stop,
+            )
+            all_reviews.extend(audience)
+            running += len(audience)
+
+        # Snap final progress to the actual collected count.
+        if on_progress:
+            on_progress(len(all_reviews), len(all_reviews))
 
         return all_reviews
 
