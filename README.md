@@ -52,7 +52,7 @@ python cli.py
 
 - **Search movies/TV shows** on Rotten Tomatoes by name or direct URL
 - **View movie details**: title, year, genre, plot, cast, director, Tomatometer, Popcornmeter, box office, and more
-- **TV series support** with per-season selection and a per-episode breakdown table (Tomatometer %, critic count, average score on a 0-10 scale, audience score) shown before scraping
+- **TV series support** with a Seasons table (Tomatometer %, Popcornmeter %, exact review counts) and per-season selection (single, range, comma-separated, or `all`)
 - **Full review scraping** of both critic (Tomatometer) and audience (Popcornmeter) reviews — for TV shows reviews are aggregated across all selected seasons
 - **Sentiment analysis** with an NLP transformer model (1-5 star scale)
 - **Export** to CSV, JSON, or Excel (.xlsx) with styled headers
@@ -67,7 +67,7 @@ python cli.py
 rotten-tomatoes-sentiment-scraper/
 ├── cli.py            # Interactive CLI interface (Rich)
 ├── scraper_rt.py     # Rotten Tomatoes scraper (requests + BeautifulSoup)
-├── models.py         # Shared dataclasses (MovieInfo, ReviewData, MovieResult, SeasonInfo, EpisodeInfo)
+├── models.py         # Shared dataclasses (MovieInfo, ReviewData, MovieResult, SeasonInfo)
 ├── sentiment.py      # Sentiment analysis module (transformers + nlptown BERT)
 ├── requirements.txt  # Python dependencies
 ├── exports/          # Output folder for exported files (created automatically)
@@ -132,11 +132,10 @@ python cli.py
 2. **If searching by query**: select the title from the results list
 3. **View title info**: plot, cast, director, Tomatometer, Popcornmeter, etc.
 4. **(TV shows only) Pick seasons**: a Seasons table is shown with per-season Tomatometer/Popcornmeter and exact review counts; you choose which seasons to scrape (single, range, comma-separated, or `all`)
-5. **(TV shows only) Per-episode breakdown**: for each selected season a table with episode title, air date, Tomatometer %, critic count, average score (0-10), audience is shown
-6. **Scrape reviews**: scrapes all critic and audience reviews with a real-time progress bar; for TV shows reviews are pulled per-season and merged
-7. **Sentiment analysis** (optional): assigns a 1-5 star sentiment score to each review
-8. **Browse reviews**: paginated display with original rating and sentiment score
-9. **Export** (optional): save to CSV, JSON, or Excel in the `exports/` folder
+5. **Scrape reviews**: scrapes all critic and audience reviews with a real-time progress bar; for TV shows reviews are pulled per-season and merged
+6. **Sentiment analysis** (optional): assigns a 1-5 star sentiment score to each review
+7. **Browse reviews**: paginated display with original rating and sentiment score
+8. **Export** (optional): save to CSV, JSON, or Excel in the `exports/` folder
 
 ---
 
@@ -325,33 +324,6 @@ The CLI detects the `/tv/` URL and fetches the season list (in parallel). The Se
   ✔ Selected: Season 1, Season 2
 ```
 
-For each selected season the CLI loads a **per-episode breakdown** in parallel and prints one table per season. Episodes show the air date, the Tomatometer % (derived from `criticsScore.likedCount / reviewCount` when RT itself doesn't aggregate one), the number of critic reviews, the average numeric score (0-10, computed from the first page of critic reviews that include an explicit `originalScore`), and the audience score:
-
-```
-                            Season 1 — Episodes (8)
-  ┌──────┬──────────────────────────────┬──────────────┬────────┬─────────┬───────────┬──────────┐
-  │  #   │ Title                        │    Aired     │ Tomato │ Critics │ Avg score │ Audience │
-  ├──────┼──────────────────────────────┼──────────────┼────────┼─────────┼───────────┼──────────┤
-  │ e01  │ The Name of the Game         │ Jul 26, 2019 │  100%  │       1 │     —     │    —     │
-  │ e02  │ Cherry                       │ Jul 26, 2019 │  100%  │       1 │     —     │    —     │
-  │ e03  │ Get Some                     │ Jul 26, 2019 │  100%  │       1 │     —     │    —     │
-  │ e04  │ The Female of the Species    │ Jul 26, 2019 │  100%  │       1 │     —     │    —     │
-  │  …                                  │              │        │         │           │          │
-  └──────┴──────────────────────────────┴──────────────┴────────┴─────────┴───────────┴──────────┘
-
-                            Season 6 — Episodes (10)   (e.g. Game of Thrones, for comparison)
-  ┌──────┬──────────────────────────────┬──────────────┬────────┬─────────┬─────────────┬──────────┐
-  │  #   │ Title                        │    Aired     │ Tomato │ Critics │  Avg score  │ Audience │
-  ├──────┼──────────────────────────────┼──────────────┼────────┼─────────┼─────────────┼──────────┤
-  │ e04  │ Book of the Stranger         │ May 15, 2016 │  100%  │      65 │  9.0/10 (2) │    —     │
-  │ e09  │ Battle of the Bastards       │ Jun 19, 2016 │   98%  │      65 │  8.0/10 (2) │    —     │
-  │ e10  │ The Winds of Winter          │ Jun 26, 2016 │   99%  │      72 │  8.5/10 (3) │    —     │
-  │  …                                  │              │        │         │             │          │
-  └──────┴──────────────────────────────┴──────────────┴────────┴─────────┴─────────────┴──────────┘
-```
-
-> **Note on `Avg score`**: per-episode aggregated critic scores barely exist on RT — most episodes have only Fresh/Rotten labels with no numeric `originalScore`. The column shows `—` for those. Popular shows like Game of Thrones occasionally have 2-3 reviews per episode with explicit `9/10`-style scores; those are averaged on the 0-10 scale and displayed alongside the count of contributing reviews.
-
 After confirming, scraping runs across all selected seasons. The progress bar starts at the **exact** computed total (sum of Tomatometer + Popcornmeter counts across selected seasons) — no rolling estimate:
 
 ```
@@ -384,19 +356,17 @@ From the movie page, the scraper extracts data from **three sources**:
 
 ### 3. Review Scraping
 
-Reviews are **not** scraped from the HTML page. Rotten Tomatoes exposes an **internal API** (undocumented), with three different paths depending on what's being reviewed:
+Reviews are **not** scraped from the HTML page. Rotten Tomatoes exposes an **internal API** (undocumented), with two different paths depending on what's being reviewed:
 
 ```
 GET /napi/rtcf/v1/movies/{ems_id}/reviews?type={critic|audience}
 GET /napi/rtcf/v1/tv/seasons/{ems_id}/reviews?type={critic|audience}
-GET /napi/rtcf/v1/tv/episodes/{ems_id}/reviews?type={critic|audience}
 ```
 
 Key points:
 
 - For **movies**, the `ems_id` is taken from `reviewsData.media.emsId` on the movie page.
 - For **TV series**, the show-level endpoint **does not exist** (`/napi/rtcf/v1/tv/...{show_ems_id}/reviews` returns 404). Reviews live at the season level. The scraper resolves each season's `ems_id` from the dedicated `<script data-json="vanity">` block on the season page (or `props.vanity.emsId` on `/reviews`) — note that `media.emsId` on a season page is the *show* id and is **not** the right value to call the API with.
-- For **per-episode** breakdowns, the same convention applies but with `tv/episodes/{ep_ems_id}`.
 - `type=critic` returns Tomatometer reviews, `type=audience` returns Popcornmeter reviews.
 
 The API returns reviews in JSON pages with **cursor-based pagination** (`pageInfo.endCursor`, `pageInfo.hasNextPage`). The scraper automatically follows all pages until exhaustion, with a **0.5-second delay** between requests to avoid rate limiting.
