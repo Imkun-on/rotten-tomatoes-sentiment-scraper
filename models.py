@@ -1,6 +1,6 @@
 """Shared data models for all scrapers."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -9,6 +9,19 @@ class MovieResult:
     year: str
     url: str
     score: str  # percentage or rating string
+
+
+@dataclass
+class SeasonInfo:
+    number: int          # 1, 2, 3, ...
+    name: str            # "Season 1"
+    url: str             # https://www.rottentomatoes.com/tv/the_boys_2019/s01
+    ems_id: str = ""     # populated by enrich_seasons() (vanity.emsId)
+    episode_count: int = 0
+    tomatometer: str = "N/A"        # "85%"
+    tomatometer_num: int = 0        # exact critic review count
+    popcornmeter: str = "N/A"       # "90%"
+    popcornmeter_num: int = 0       # exact audience review count
 
 
 @dataclass
