@@ -20,7 +20,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-from models import MovieInfo, ReviewData
+from models import MovieInfo, ReviewData, SeasonInfo
 from scraper_rt import RTScraper
 from sentiment import analyze_reviews
 
@@ -45,6 +45,29 @@ SYM_OK = "\u2714"      # ✔
 SYM_FAIL = "\u2716"    # ✖
 SYM_ARROW = "\u2192"   # →
 SYM_DOT = "\u2022"     # •
+
+
+# ------------------------------------------------------------------
+# First-prompt resilience
+# ------------------------------------------------------------------
+
+# Windows + PowerShell occasionally injects a phantom KeyboardInterrupt on
+# the very first stdin read of a fresh Python session. This wrapper retries
+# the first prompt of the session exactly once, then becomes a passthrough,
+# so genuine Ctrl+C continues to work for every subsequent prompt.
+_FIRST_PROMPT_DONE = False
+
+
+def _ask_resilient_first(prompt_method, *args, **kwargs):
+    global _FIRST_PROMPT_DONE
+    if _FIRST_PROMPT_DONE:
+        return prompt_method(*args, **kwargs)
+    try:
+        result = prompt_method(*args, **kwargs)
+    except KeyboardInterrupt:
+        result = prompt_method(*args, **kwargs)
+    _FIRST_PROMPT_DONE = True
+    return result
 
 
 # ------------------------------------------------------------------
@@ -150,6 +173,88 @@ def show_movie_info(info: MovieInfo):
         expand=False,
         padding=(1, 3),
     ))
+
+
+def show_seasons(seasons: list[SeasonInfo]):
+    """Display the list of TV seasons in a styled table."""
+    table = Table(
+        title=f"Seasons ({len(seasons)})",
+        border_style="bright_cyan",
+        box=ROUNDED,
+        title_style="bold bright_cyan",
+        row_styles=["", "dim"],
+    )
+    table.add_column("#", style="bold bright_white", justify="center", width=4)
+    table.add_column("Season", style="info")
+    table.add_column("Episodes", justify="center", style="bright_yellow")
+    table.add_column("Tomatometer", justify="center", style="bold red")
+    table.add_column("Popcornmeter", justify="center", style="bold yellow")
+    table.add_column("Total", justify="right", style="bright_green")
+
+    # Pre-format each meter as "{pct:>w} ({cnt:>w})" with widths derived from
+    # the widest value in the column. With every cell formatted to the same
+    # width, center-justify keeps the % and the count visually aligned.
+    def _fmt_pairs(pct_attr: str, num_attr: str):
+        pcts, cnts = [], []
+        for s in seasons:
+            pct = getattr(s, pct_attr)
+            num = getattr(s, num_attr)
+            pcts.append(pct if pct and pct != "N/A" else "—")
+            cnts.append(f"{num:,}" if num else "—")
+        wp = max(len(p) for p in pcts)
+        wc = max(len(c) for c in cnts)
+        return [f"{p:>{wp}} ({c:>{wc}})" for p, c in zip(pcts, cnts)]
+
+    tomato_cells = _fmt_pairs("tomatometer", "tomatometer_num")
+    popcorn_cells = _fmt_pairs("popcornmeter", "popcornmeter_num")
+
+    for i, s in enumerate(seasons, 1):
+        eps = str(s.episode_count) if s.episode_count else "—"
+        total = s.tomatometer_num + s.popcornmeter_num
+        total_str = f"{total:,}" if total else "—"
+        table.add_row(
+            str(i), s.name, eps,
+            tomato_cells[i - 1], popcorn_cells[i - 1],
+            total_str,
+        )
+
+    console.print(table)
+
+
+
+def parse_season_selection(spec: str, total: int) -> list[int]:
+    """Parse '1', '1-3', '1,3,5', '1-2,4', 'all' into a sorted list of indices.
+
+    Indices are 1-based positions into the season list, NOT season numbers.
+    Invalid tokens are ignored; out-of-range indices are clamped.
+    """
+    spec = (spec or "").strip().lower()
+    if not spec or spec in ("all", "a", "*"):
+        return list(range(1, total + 1))
+
+    picked: set[int] = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            try:
+                a, b = token.split("-", 1)
+                lo, hi = int(a), int(b)
+                if lo > hi:
+                    lo, hi = hi, lo
+                for i in range(max(1, lo), min(total, hi) + 1):
+                    picked.add(i)
+            except ValueError:
+                continue
+        else:
+            try:
+                i = int(token)
+                if 1 <= i <= total:
+                    picked.add(i)
+            except ValueError:
+                continue
+    return sorted(picked)
 
 
 def show_reviews(reviews: list[ReviewData], page_size: int = 10):
@@ -342,7 +447,9 @@ def main():
             console.print("[title]Search mode[/title]")
             console.print(f"  [bold]1[/bold]  {SYM_ARROW}  Search by query")
             console.print(f"  [bold]2[/bold]  {SYM_ARROW}  Paste a Rotten Tomatoes URL")
-            mode = Prompt.ask("  Choose", choices=["1", "2"], default="1")
+            mode = _ask_resilient_first(
+                Prompt.ask, "  Choose", choices=["1", "2"], default="1",
+            )
 
             if mode == "1":
                 # Search by query
@@ -382,6 +489,38 @@ def main():
 
             console.print()
             show_movie_info(movie_info)
+
+            # TV show: pick seasons before scraping.
+            selected_seasons: list[SeasonInfo] | None = None
+            if "/tv/" in selected_url and "/s" not in selected_url.split("/tv/", 1)[1]:
+                with console.status("[info]Fetching seasons...[/info]", spinner="dots"):
+                    seasons = scraper.get_seasons(selected_url)
+
+                if not seasons:
+                    console.print("[warning]No seasons found for this TV show.[/warning]")
+                    continue
+
+                with console.status(
+                    f"[info]Loading details for {len(seasons)} seasons...[/info]",
+                    spinner="dots",
+                ):
+                    scraper.enrich_seasons(seasons)
+
+                console.print()
+                show_seasons(seasons)
+                console.print(
+                    f"  [dim]Selection syntax: [bold]1[/bold] | "
+                    f"[bold]1-3[/bold] | [bold]1,3,5[/bold] | [bold]all[/bold][/dim]"
+                )
+                spec = Prompt.ask("  Choose season(s)", default="all")
+                indices = parse_season_selection(spec, len(seasons))
+                if not indices:
+                    console.print("[error]Invalid selection.[/error]")
+                    continue
+                selected_seasons = [seasons[i - 1] for i in indices]
+
+                names = ", ".join(s.name for s in selected_seasons)
+                console.print(f"  {SYM_OK} [success]Selected:[/success] {names}")
 
             # Scrape reviews?
             console.print()
@@ -427,6 +566,7 @@ def main():
                 reviews = scraper.scrape_reviews(
                     selected_url,
                     movie_info=movie_info,
+                    seasons=selected_seasons,
                     on_progress=on_progress,
                 )
                 if not all_reviews:
